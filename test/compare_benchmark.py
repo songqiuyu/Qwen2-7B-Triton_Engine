@@ -18,6 +18,7 @@ import kernels.rmsnorm
 import kernels.rope
 import kernels.silu_mul
 import kernels.fused_add_rmsnorm
+import kernels.flash_attention
 
 # ============================================================
 # Pure PyTorch Fallback Implementations (Baseline)
@@ -97,6 +98,10 @@ def torch_awq_gemm(x, qweight, qzeros, scales, group_size=128):
 def run_benchmark(model, tokenizer, use_triton=True, num_runs=3, max_tokens=150):
     import kernels.awq_gemm
     
+    # PyTorch SDPA fallback for attention
+    def torch_flash_attention(q, k, v, is_causal=False):
+        return torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+    
     if use_triton:
         # Use Triton kernels
         kernels.rmsnorm.rmsnorm_forward = _original_rmsnorm
@@ -104,6 +109,7 @@ def run_benchmark(model, tokenizer, use_triton=True, num_runs=3, max_tokens=150)
         kernels.silu_mul.silu_mul_forward = _original_silu_mul
         kernels.fused_add_rmsnorm.fused_add_rmsnorm_forward = _original_fused_add_rmsnorm
         kernels.awq_gemm.awq_gemm_forward = _original_awq_gemm
+        kernels.flash_attention.flash_attention_forward = _original_flash_attn
         mode = "🚀 Triton Optimized"
     else:
         # Use pure PyTorch
@@ -112,6 +118,7 @@ def run_benchmark(model, tokenizer, use_triton=True, num_runs=3, max_tokens=150)
         kernels.silu_mul.silu_mul_forward = torch_silu_mul
         kernels.fused_add_rmsnorm.fused_add_rmsnorm_forward = torch_fused_add_rmsnorm
         kernels.awq_gemm.awq_gemm_forward = torch_awq_gemm
+        kernels.flash_attention.flash_attention_forward = torch_flash_attention
         mode = "🐢 Pure PyTorch Baseline"
 
     engine = TritonInferenceEngine(model, tokenizer, max_seq_len=2048, device="cuda")
@@ -169,12 +176,13 @@ def main():
     
     # Save original Triton kernel references
     import kernels.awq_gemm
-    global _original_rmsnorm, _original_rope, _original_silu_mul, _original_fused_add_rmsnorm, _original_awq_gemm
+    global _original_rmsnorm, _original_rope, _original_silu_mul, _original_fused_add_rmsnorm, _original_awq_gemm, _original_flash_attn
     _original_rmsnorm = kernels.rmsnorm.rmsnorm_forward
     _original_rope = kernels.rope.apply_rope_inplace
     _original_silu_mul = kernels.silu_mul.silu_mul_forward
     _original_fused_add_rmsnorm = kernels.fused_add_rmsnorm.fused_add_rmsnorm_forward
     _original_awq_gemm = kernels.awq_gemm.awq_gemm_forward
+    _original_flash_attn = kernels.flash_attention.flash_attention_forward
 
     print("\n" + "=" * 60)
     print("  BENCHMARK: TRITON OPTIMIZED vs PURE PYTORCH BASELINE  ")

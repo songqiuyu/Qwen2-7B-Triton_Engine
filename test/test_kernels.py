@@ -163,6 +163,38 @@ def test_awq_dequant():
     assert mean_rel_diff < 0.1, f"AWQ GEMM mean relative error too high: {mean_rel_diff}"
     print("  ✅ AWQ GEMM passed!\n")
 
+def test_flash_attention():
+    """Test FlashAttention kernel against PyTorch SDPA."""
+    print("Testing FlashAttention Kernel...")
+    from kernels.flash_attention import flash_attention_forward
+    
+    batch, num_heads, seq_len, head_dim = 1, 28, 32, 128
+    
+    q = torch.randn(batch, num_heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+    k = torch.randn(batch, num_heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+    v = torch.randn(batch, num_heads, seq_len, head_dim, dtype=torch.float16, device="cuda")
+    
+    # Test causal (prefill mode)
+    torch_out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+    triton_out = flash_attention_forward(q, k, v, is_causal=True)
+    
+    diff_causal = (triton_out - torch_out).abs().max()
+    print(f"  FlashAttn Causal Max Diff: {diff_causal:.6f}")
+    assert diff_causal < 0.05, f"FlashAttention causal failed! Max diff: {diff_causal}"
+    
+    # Test non-causal (decode mode: seq_len_q=1, seq_len_kv=many)
+    q_decode = torch.randn(1, num_heads, 1, head_dim, dtype=torch.float16, device="cuda")
+    k_decode = torch.randn(1, num_heads, 64, head_dim, dtype=torch.float16, device="cuda")
+    v_decode = torch.randn(1, num_heads, 64, head_dim, dtype=torch.float16, device="cuda")
+    
+    torch_out_d = torch.nn.functional.scaled_dot_product_attention(q_decode, k_decode, v_decode, is_causal=False)
+    triton_out_d = flash_attention_forward(q_decode, k_decode, v_decode, is_causal=False)
+    
+    diff_decode = (triton_out_d - torch_out_d).abs().max()
+    print(f"  FlashAttn Decode Max Diff: {diff_decode:.6f}")
+    assert diff_decode < 0.05, f"FlashAttention decode failed! Max diff: {diff_decode}"
+    print("  ✅ FlashAttention passed!\n")
+
 
 if __name__ == "__main__":
     print("=" * 50)
@@ -174,6 +206,7 @@ if __name__ == "__main__":
     test_silu_mul()
     test_fused_add_rmsnorm()
     test_awq_dequant()
+    test_flash_attention()
     
     print("=" * 50)
     print("  ✅ All kernel tests passed!")

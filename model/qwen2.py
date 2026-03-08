@@ -9,6 +9,7 @@ import kernels.fused_add_rmsnorm
 import kernels.rope
 import kernels.awq_gemm
 import kernels.silu_mul
+import kernels.flash_attention
 import math
 
 class Qwen2RMSNorm(nn.Module):
@@ -117,9 +118,9 @@ class Qwen2Attention(nn.Module):
         # Use causal mask only for prefill. For single token decoding, not needed
         is_causal = seq_len > 1
         
-        # PyTorch 2.x SDPA (auto-selects FlashAttention / memory-efficient / math backend)
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, 
+        # Triton FlashAttention-2 with online softmax
+        attn_output = kernels.flash_attention.flash_attention_forward(
+            q, k, v,
             is_causal=is_causal
         )
         
