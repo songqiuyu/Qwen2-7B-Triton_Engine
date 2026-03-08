@@ -128,7 +128,12 @@ def flash_attention_forward(
         out: (batch, num_heads, seq_len_q, head_dim) float16
     """
     batch, num_heads, seq_len_q, head_dim = q.shape
-    _, _, seq_len_kv, _ = k.shape
+    _, num_kv_heads, seq_len_kv, _ = k.shape
+    
+    scale = 1.0 / math.sqrt(head_dim)
+    
+    if seq_len_q == 1 and seq_len_kv >= 128:
+        return flash_decode_forward(q, k, v, scale)
     
     assert head_dim in {64, 128, 256}, f"head_dim={head_dim} not supported, must be 64/128/256"
     
@@ -165,6 +170,158 @@ def flash_attention_forward(
         BLOCK_HEADDIM=head_dim,
         num_warps=num_warps,
         num_stages=2,
+    )
+    
+    return out
+
+
+# --- Stage 1: Compute partial attention over split K/V ---
+@triton.jit
+def _flash_decoding_stage1(
+    Q, K, V, Out_mid, L_mid,
+    stride_qz, stride_qh, stride_qm, stride_qd,
+    stride_kz, stride_kh, stride_kn, stride_kd,
+    stride_vz, stride_vh, stride_vn, stride_vd,
+    stride_oz, stride_oh, stride_osplit, stride_od,
+    stride_lz, stride_lh,
+    seq_len_kv,
+    num_kv_heads: tl.constexpr,
+    num_heads: tl.constexpr,
+    scale,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    split_id = tl.program_id(0)
+    batch_head_id = tl.program_id(1)
+    
+    batch_id = batch_head_id // num_heads
+    head_id = batch_head_id % num_heads
+    kv_head_id = head_id // (num_heads // num_kv_heads)
+    
+    start_n = split_id * BLOCK_N
+    if start_n >= seq_len_kv:
+        return
+        
+    offs_d = tl.arange(0, BLOCK_D)
+    
+    # Load Q (1, BLOCK_D)
+    q_ptrs = Q + batch_id * stride_qz + head_id * stride_qh + offs_d * stride_qd
+    q = tl.load(q_ptrs).to(tl.float32)
+    
+    # Accumulators for online softmax
+    m_i = -1e20
+    l_i = 0.0
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    
+    offs_n = start_n + tl.arange(0, BLOCK_N)
+    kv_mask = offs_n < seq_len_kv
+    
+    # Load K (BLOCK_N, BLOCK_D)
+    k_ptrs = K + batch_id * stride_kz + kv_head_id * stride_kh + offs_n[:, None] * stride_kn + offs_d[None, :] * stride_kd
+    k = tl.load(k_ptrs, mask=kv_mask[:, None], other=0.0).to(tl.float32)
+    
+    # Q @ K.T -> (BLOCK_N,)
+    s = tl.sum(q[None, :] * k, axis=1) * scale
+    s = tl.where(kv_mask, s, -1e20)
+    
+    # Online Softmax update
+    m_new = tl.max(s)
+    alpha = tl.exp(m_i - m_new)
+    p = tl.exp(s - m_new)
+    
+    # Load V (BLOCK_N, BLOCK_D)
+    v_ptrs = V + batch_id * stride_vz + kv_head_id * stride_vh + offs_n[:, None] * stride_vn + offs_d[None, :] * stride_vd
+    v = tl.load(v_ptrs, mask=kv_mask[:, None], other=0.0).to(tl.float32)
+    
+    # acc = acc * alpha + p @ V
+    l_i = l_i * alpha + tl.sum(p)
+    acc = acc * alpha + tl.sum(p[:, None] * v, axis=0)
+    
+    # Store partials
+    o_ptrs = Out_mid + batch_id * stride_oz + head_id * stride_oh + split_id * stride_osplit + offs_d * stride_od
+    l_ptrs = L_mid + batch_id * stride_lz + head_id * stride_lh + split_id
+    
+    tl.store(o_ptrs, acc / l_i)
+    tl.store(l_ptrs, m_new + tl.math.log(l_i)) # store LogSumExp
+
+
+# --- Stage 2: Reduction ---
+@triton.jit
+def _flash_decoding_stage2(
+    Out_mid, L_mid, Out,
+    stride_oz, stride_oh, stride_osplit, stride_od,
+    stride_lz, stride_lh,
+    stride_outz, stride_outh, stride_outm, stride_outd,
+    num_heads: tl.constexpr,
+    num_splits,
+    BLOCK_D: tl.constexpr,
+):
+    batch_head_id = tl.program_id(0)
+    batch_id = batch_head_id // num_heads
+    head_id = batch_head_id % num_heads
+    
+    offs_d = tl.arange(0, BLOCK_D)
+    
+    m_all = -1e20
+    l_all = 0.0
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+    
+    for split_id in range(num_splits):
+        o_ptrs = Out_mid + batch_id * stride_oz + head_id * stride_oh + split_id * stride_osplit + offs_d * stride_od
+        l_ptrs = L_mid + batch_id * stride_lz + head_id * stride_lh + split_id
+        
+        o_mid = tl.load(o_ptrs)
+        lse_mid = tl.load(l_ptrs) # LogSumExp
+        
+        m_new = tl.maximum(m_all, lse_mid)
+        alpha = tl.exp(m_all - m_new)
+        p = tl.exp(lse_mid - m_new)
+        
+        acc = acc * alpha + o_mid * p
+        l_all = l_all * alpha + p
+        m_all = m_new
+        
+    out = acc / l_all
+    
+    out_ptrs = Out + batch_head_id * stride_outh + offs_d * stride_outd
+    tl.store(out_ptrs, out.to(tl.float16))
+
+
+def flash_decode_forward(q, k, v, scale):
+    batch, num_heads, seq_len_q, head_dim = q.shape
+    _, num_kv_heads, seq_len_kv, _ = k.shape
+    
+    BLOCK_N = 64
+    BLOCK_D = triton.next_power_of_2(head_dim)
+    num_splits = triton.cdiv(seq_len_kv, BLOCK_N)
+    
+    out_mid = torch.empty((batch, num_heads, num_splits, head_dim), dtype=torch.float32, device=q.device)
+    l_mid = torch.empty((batch, num_heads, num_splits), dtype=torch.float32, device=q.device)
+    
+    grid1 = (num_splits, batch * num_heads)
+    
+    _flash_decoding_stage1[grid1](
+        q, k, v, out_mid, l_mid,
+        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
+        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
+        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
+        out_mid.stride(0), out_mid.stride(1), out_mid.stride(2), out_mid.stride(3),
+        l_mid.stride(0), l_mid.stride(1),
+        seq_len_kv, num_kv_heads, num_heads, scale,
+        BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D,
+        num_warps=4,
+    )
+    
+    out = torch.empty_like(q)
+    grid2 = (batch * num_heads,)
+    
+    _flash_decoding_stage2[grid2](
+        out_mid, l_mid, out,
+        out_mid.stride(0), out_mid.stride(1), out_mid.stride(2), out_mid.stride(3),
+        l_mid.stride(0), l_mid.stride(1),
+        out.stride(0), out.stride(1), out.stride(2), out.stride(3),
+        num_heads, num_splits, BLOCK_D=BLOCK_D,
+        num_warps=4,
     )
     
     return out

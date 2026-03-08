@@ -28,11 +28,11 @@ def main():
     engine = TritonInferenceEngine(model, tokenizer, max_seq_len=2048, device="cuda")
     
     print("\n" + "="*50)
-    prompt = "<|im_start|>user\n请你介绍一下英雄联盟这款游戏<|im_end|>\n<|im_start|>assistant\n"
+    prompt = "<|im_start|>user\n介绍一下西安<|im_end|>\n<|im_start|>assistant\n"
     print(f"Prompt: {prompt}")
     print("="*50 + "\n")
     
-    engine.generate(prompt, max_new_tokens=256, temperature=0.7)
+    engine.generate(prompt, max_new_tokens=512, temperature=0.7)
 
 if __name__ == "__main__":
     main()

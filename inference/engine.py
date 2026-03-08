@@ -27,6 +27,39 @@ class TritonInferenceEngine:
         # Pre-allocate decode-phase tensors to avoid per-step allocation
         self._decode_input_ids = torch.zeros((1, 1), dtype=torch.long, device=device)
         self._decode_position_ids = torch.zeros((1, 1), dtype=torch.long, device=device)
+        
+        # CUDA Graph states
+        self.decode_graph = None
+        self.graph_logits_out = None
+
+    def _capture_decode_graph(self):
+        """Record the CUDA graph for the decode phase."""
+        if self.decode_graph is not None:
+            return
+            
+        print("\n[CUDA Graph] Capturing Decode Graph...")
+        
+        # Warmup (using a stream to not sync with main yet)
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            for _ in range(3):
+                self.graph_logits_out = self.model(
+                    input_ids=self._decode_input_ids,
+                    position_ids=self._decode_position_ids,
+                    kv_caches=self.kv_manager
+                )
+        torch.cuda.current_stream().wait_stream(s)
+        
+        # Capture
+        self.decode_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.decode_graph):
+            self.graph_logits_out = self.model(
+                input_ids=self._decode_input_ids,
+                position_ids=self._decode_position_ids,
+                kv_caches=self.kv_manager
+            )
+        print("[CUDA Graph] Capture complete.")
 
     @torch.no_grad()
     def generate(self, prompt: str, max_new_tokens: int = 512, temperature: float = 0.7, top_p: float = 0.9, print_stream=True):
@@ -73,16 +106,22 @@ class TritonInferenceEngine:
 
         cur_token_val = next_token.item()
         
+        # Make sure graph is captured based on the exact batch size/shapes
+        self._decode_input_ids.fill_(cur_token_val)
+        self._decode_position_ids.fill_(self.kv_manager.current_seq_len)
+        self._capture_decode_graph()
+        
         for _ in range(max_new_tokens - 1):
-            # Use pre-allocated tensors to avoid per-step allocation
-            self._decode_input_ids[0, 0] = cur_token_val
-            self._decode_position_ids[0, 0] = self.kv_manager.current_seq_len
+            # Update inputs
+            input_ids = torch.tensor([[cur_token_val]], dtype=torch.long, device=self.device)
+            position_ids = torch.tensor([[self.kv_manager.current_seq_len]], dtype=torch.long, device=self.device)
             
             logits = self.model(
-                input_ids=self._decode_input_ids,
-                position_ids=self._decode_position_ids,
+                input_ids=input_ids,
+                position_ids=position_ids,
                 kv_caches=self.kv_manager
             )
+            
             self.kv_manager.advance(1)
             
             next_token_logits = logits[:, -1, :]
