@@ -2,34 +2,62 @@ import torch
 import triton
 import triton.language as tl
 
+# AutoAWQ bit-field interleaving order: [0, 4, 1, 5, 2, 6, 3, 7]
+# Each INT32 packs 8 x 4-bit weights. The unpacking shift amounts are:
+# weight_i = (packed >> (order[i] * 4)) & 0xF
+# order[i] = (i // 2) + (i % 2) * 4
+
+@triton.autotune(
+    configs=[
+        # Conservative configs to fit RTX 4080's 101KB shared memory
+        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
+        triton.Config({'BLOCK_SIZE_M': 16, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE_M': 8}, num_stages=2, num_warps=4),
+    ],
+    key=['M', 'N', 'K'],
+)
 @triton.jit
 def _awq_gemm_kernel(
-    A_ptr, B_ptr, C_ptr, Scales_ptr, Zeros_ptr,
+    # Pointers
+    A_ptr,          # (M, K) fp16 activations
+    QW_ptr,         # (K, N // 8) int32 packed weights
+    QZ_ptr,         # (K // group_size, N // 8) int32 packed zeros
+    Scales_ptr,     # (K // group_size, N) fp16 scales
+    C_ptr,          # (M, N) fp16 output
+    # Matrix dimensions
     M, N, K,
+    # Strides
     stride_am, stride_ak,
-    stride_bk, stride_bn,
+    stride_qw_k, stride_qw_n,
+    stride_qz_k, stride_qz_n,
+    stride_s_k, stride_s_n,
     stride_cm, stride_cn,
-    stride_sk, stride_sn,
-    stride_zk, stride_zn,
+    # Quantization config
     group_size: tl.constexpr,
-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr
+    # Tile sizes
+    BLOCK_SIZE_M: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_K: tl.constexpr,
+    GROUP_SIZE_M: tl.constexpr,
 ):
     """
-    AWQ W4A16 GEMM kernel
-    A: (M, K) - FP16 Activation
-    B: (K//8, N) - INT32 Packed Weights (each int32 holds eight 4-bit weights)
-    C: (M, N) - FP16 Output
-    Scales: (K//group_size, N) - FP16
-    Zeros: (K//group_size, N//8) - INT32 Packed Zeros (each int32 holds eight 4-bit zeros)
+    Fused AWQ W4A16 GEMM: Dequantize INT4 weights on-the-fly and multiply with FP16 activations.
     
-    AWQ quantizes group_size elements along K dimension.
+    AutoAWQ packs 8 x 4-bit weights per INT32 with interleaved order [0,4,1,5,2,6,3,7].
+    Zeros use the same packing format.
+    
+    This kernel fuses: unpack INT4 -> subtract zeros -> multiply scales -> GEMM accumulate
     """
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
     num_pid_n = tl.cdiv(N, BLOCK_SIZE_N)
     
-    # Grid optimization: Swizzle block mapping
+    # L2 cache-friendly swizzle
     num_pid_in_group = GROUP_SIZE_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_SIZE_M
@@ -37,105 +65,95 @@ def _awq_gemm_kernel(
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Pointers
+    # Offsets for the M and N dimensions
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     offs_n = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
-    offs_k = tl.arange(0, BLOCK_SIZE_K)
     
-    a_ptrs = A_ptr + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+    # For packed weights: N columns are stored as N//8 int32 columns
+    packed_n = offs_n // 8           # which int32 column
+    element_idx = offs_n % 8         # which element within the int32
     
-    # Because B is packed (K // 8, N), a given K corresponds to row `K // 8`. 
-    # The inner offset is `K % 8`.
-    # To load a block of K size, it translates to `BLOCK_SIZE_K // 8` rows of B.
-    # To keep it simple, we demand BLOCK_SIZE_K to be a multiple of 8.
+    # AutoAWQ interleaving shift: order[i] = (i // 2) + (i % 2) * 4
+    shift_amount = ((element_idx // 2) + (element_idx % 2) * 4) * 4
     
-    # 假设 BLOCK_SIZE_K = 32, 则 packed_k_offs有 4 个.
-    packed_k_offs = tl.arange(0, BLOCK_SIZE_K // 8)
-    b_ptrs = B_ptr + (packed_k_offs[:, None] * stride_bk + offs_n[None, :] * stride_bn)
-
-    accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
-
-    for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-        # Load A
-        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & ((offs_k[None, :] + k * BLOCK_SIZE_K) < K), other=0.0)
+    # Accumulator in FP32 for precision
+    acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+    
+    # K-dimension loop
+    for k_start in range(0, K, BLOCK_SIZE_K):
+        offs_k = k_start + tl.arange(0, BLOCK_SIZE_K)
         
-        # Load Packed B (shape: BLOCK_SIZE_K // 8, BLOCK_SIZE_N)
-        b_packed = tl.load(b_ptrs, mask=(packed_k_offs[:, None] + k * (BLOCK_SIZE_K // 8) < K // 8) & (offs_n[None, :] < N), other=0)
+        # Load A tile: (BLOCK_SIZE_M, BLOCK_SIZE_K)
+        a_mask = (offs_m[:, None] < M) & (offs_k[None, :] < K)
+        a = tl.load(A_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak, 
+                     mask=a_mask, other=0.0)
         
-        # Here we need to unpack B. 
-        # Since B shape is 1 INT32 -> 8 INT4.
+        # Load packed weights: (BLOCK_SIZE_K, BLOCK_SIZE_N)
+        qw_ptrs = QW_ptr + offs_k[:, None] * stride_qw_k + packed_n[None, :] * stride_qw_n
+        qw_mask = (offs_k[:, None] < K) & (packed_n[None, :] < (N // 8))
+        qw_packed = tl.load(qw_ptrs, mask=qw_mask, other=0)
         
-        # For simplicity in this base version, let's unpack explicitly
-        # We need to construct a (BLOCK_SIZE_K, BLOCK_SIZE_N) float16 tensor from `b_packed`.
-        # Triton doesn't have native 4-bit unpacking array ops that yield cleanly directly out-of-the-box
-        # without bitwise shifts. 
+        # Extract 4-bit weights
+        w_int4 = (qw_packed >> shift_amount[None, :]) & 0xF
         
-        # Unpack loop
-        b_unpacked = tl.zeros((BLOCK_SIZE_K, BLOCK_SIZE_N), dtype=tl.int32)
-        # Shift and mask manually
-        for shift in range(8):
-            mask4 = 0x0F
-            # extract 4 bits
-            extracted = (b_packed >> (shift * 4)) & mask4
-            # place in b_unpacked at row `packed_k * 8 + shift`
-            # Triton doesn't support assigning to slices easily, so we usually broadcast and compute on the fly
-            pass # (This is placeholder structure, real bitwise unpacking comes below)
-            
-        # Due to constraints, building a fully optimized AWQ kernel from scratch in Triton 
-        # requires very complex bitwise wizardry and layout conversions.
-        # Below is a conceptual / slightly simplified version that handles fetching.
+        # Load zeros
+        group_idx = offs_k // group_size
+        qz_ptrs = QZ_ptr + group_idx[:, None] * stride_qz_k + packed_n[None, :] * stride_qz_n
+        qz_mask = (group_idx[:, None] < (K // group_size)) & (packed_n[None, :] < (N // 8))
+        qz_packed = tl.load(qz_ptrs, mask=qz_mask, other=0)
         
-        a_ptrs += BLOCK_SIZE_K * stride_ak
-        b_ptrs += (BLOCK_SIZE_K // 8) * stride_bk
-
-    c_ptrs = C_ptr + stride_cm * offs_m[:, None] + stride_cn * offs_n[None, :]
+        # Extract 4-bit zeros
+        z_int4 = (qz_packed >> shift_amount[None, :]) & 0xF
+        
+        # Load scales
+        s_ptrs = Scales_ptr + group_idx[:, None] * stride_s_k + offs_n[None, :] * stride_s_n
+        s_mask = (group_idx[:, None] < (K // group_size)) & (offs_n[None, :] < N)
+        scales = tl.load(s_ptrs, mask=s_mask, other=0.0)
+        
+        # Dequantize: w_fp = (w_int4 - z_int4) * scales
+        w_fp = (w_int4.to(tl.float16) - z_int4.to(tl.float16)) * scales
+        
+        # Accumulate: acc += A_tile @ W_tile
+        acc += tl.dot(a.to(tl.float16), w_fp.to(tl.float16))
+    
+    # Store output
+    c_ptrs = C_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
-    tl.store(c_ptrs, accumulator.to(tl.float16), mask=c_mask)
+    tl.store(c_ptrs, acc.to(tl.float16), mask=c_mask)
 
-# For production, we will import triton AWQ implementation or bridge to PyTorch natively 
-# since a full robust W4A16 Triton GEMM with `group_size` mapping requires > 500 lines of highly specific layout code.
 
 def awq_gemm_forward(x: torch.Tensor, qweight: torch.Tensor, qzeros: torch.Tensor, scales: torch.Tensor, group_size: int = 128) -> torch.Tensor:
     """
+    Fused AWQ W4A16 GEMM using Triton.
+    
     Args:
         x: (..., K) fp16 inputs
         qweight: (K, N//8) int32 packed weights
-        qzeros: (K//group_size, N//8) int32 packed zeros
+        qzeros: (K//group_size, N//8) int32 packed zeros  
         scales: (K//group_size, N) fp16 scales
     Returns:
         out: (..., N) fp16 
     """
-    # PyTorch exact AWQ fallback dequantizer since writing a full W4A16 GEMM in Triton from scratch takes ~1000 lines.
     in_shape = x.shape
-    x = x.view(-1, x.shape[-1])
-    M, K = x.shape
-    pack_num = 8
+    x_flat = x.reshape(-1, x.shape[-1]).contiguous()
+    M, K = x_flat.shape
     N = scales.shape[1]
     
-    # 1. Promote qweight to allow shifting correctly
-    # qweight: (K, N // 8) -> (K, N // 8, 8)
-    qw = qweight.view(K, N // 8, 1).expand(K, N // 8, pack_num)
+    out = torch.empty((M, N), dtype=torch.float16, device=x.device)
     
-    # 2. Extract 4 bits with AutoAWQ interleaving order
-    order = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], device=x.device, dtype=torch.int32)
-    shifts = (order * 4).view(1, 1, pack_num)
-    w_fp = ((qw >> shifts) & 0xF).flatten(1, 2).view(K, N).to(torch.float16)
+    grid = lambda META: (
+        triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(N, META['BLOCK_SIZE_N']),
+    )
     
-    # 3. Handle Zeors
-    # qzeros: (K // group_size, N // 8) -> (K // group_size, N // 8, 8)
-    qz = qzeros.view(K // group_size, N // 8, 1).expand(K // group_size, N // 8, pack_num)
-    z_fp = ((qz >> shifts) & 0xF).flatten(1, 2).view(scales.shape[0], N).to(torch.float16)
-
-    # 4. Group wise scale and zero
-    # scales: (K//group_size, N)
-    w_fp = w_fp.view(K // group_size, group_size, N)
-    z_fp = z_fp.view(K // group_size, 1, N)
-    s_fp = scales.view(K // group_size, 1, N)
+    _awq_gemm_kernel[grid](
+        x_flat, qweight, qzeros, scales, out,
+        M, N, K,
+        x_flat.stride(0), x_flat.stride(1),
+        qweight.stride(0), qweight.stride(1),
+        qzeros.stride(0), qzeros.stride(1),
+        scales.stride(0), scales.stride(1),
+        out.stride(0), out.stride(1),
+        group_size=group_size,
+    )
     
-    w_fp = (w_fp - z_fp) * s_fp
-    w_fp = w_fp.view(K, N)
-    
-    # 5. Multiply
-    out = torch.matmul(x, w_fp)
     return out.view(*in_shape[:-1], N)
-

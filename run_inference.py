@@ -28,7 +28,7 @@ def main():
     engine = TritonInferenceEngine(model, tokenizer, max_seq_len=2048, device="cuda")
     
     print("\n" + "="*50)
-    prompt = "<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n"
+    prompt = "<|im_start|>user\n请你介绍一下西安<|im_end|>\n<|im_start|>assistant\n"
     print(f"Prompt: {prompt}")
     print("="*50 + "\n")
     
