@@ -1,0 +1,226 @@
+import torch
+import torch.nn as nn
+from typing import Optional, Tuple
+from model.config import Qwen2Config
+from kernels.rmsnorm import rmsnorm_forward
+from kernels.rope import apply_rope_inplace, precompute_freqs_cis
+from kernels.awq_gemm import awq_gemm_forward
+from kernels.silu_mul import silu_mul_forward
+import math
+
+class Qwen2RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        # Dispatch to our Triton Kernel
+        '''
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+        '''
+        return rmsnorm_forward(hidden_states, self.weight, self.variance_epsilon)
+
+class LinearAWQ(nn.Module):
+    """
+    Custom module to hold the packed AWQ weights and biases and dispatch to our GEMM kernel.
+    """
+    def __init__(self, in_features, out_features, group_size=128, has_bias=False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.group_size = group_size
+        
+        # Buffer placeholders to be filled during weight loading
+        self.register_buffer("qweight", torch.zeros((in_features, out_features // 8), dtype=torch.int32))
+        self.register_buffer("qzeros", torch.zeros((in_features // group_size, out_features // 8), dtype=torch.int32))
+        self.register_buffer("scales", torch.zeros((in_features // group_size, out_features), dtype=torch.float16))
+        
+        if has_bias:
+            self.register_buffer("bias", torch.zeros(out_features, dtype=torch.float16))
+        else:
+            self.bias = None
+
+    def forward(self, x):
+        out = awq_gemm_forward(x, self.qweight, self.qzeros, self.scales, self.group_size)
+        if self.bias is not None:
+            out = out + self.bias
+        return out
+
+class Qwen2Attention(nn.Module):
+    def __init__(self, config: Qwen2Config, layer_idx: int):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.hidden_size = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = self.hidden_size // self.num_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+
+        # AWQ Quantized Projections
+        self.q_proj = LinearAWQ(self.hidden_size, self.num_heads * self.head_dim, group_size=config.group_size, has_bias=True)
+        self.k_proj = LinearAWQ(self.hidden_size, self.num_key_value_heads * self.head_dim, group_size=config.group_size, has_bias=True)
+        self.v_proj = LinearAWQ(self.hidden_size, self.num_key_value_heads * self.head_dim, group_size=config.group_size, has_bias=True)
+        self.o_proj = LinearAWQ(self.num_heads * self.head_dim, self.hidden_size, group_size=config.group_size, has_bias=False)
+        
+        # Precomputed RoPE frequencies lazily initialized
+        self.cos_cached = None
+        self.sin_cached = None
+
+    def _update_rope_cache(self, device):
+        if self.cos_cached is None:
+            self.cos_cached, self.sin_cached = precompute_freqs_cis(
+                self.head_dim, self.config.max_seq_len, theta=self.config.rope_theta, device=device
+            )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_caches = None,
+    ):
+        batch_size, seq_len, _ = hidden_states.shape
+        self._update_rope_cache(hidden_states.device)
+
+        # Projections via Triton AWQ Kernel
+        q = self.q_proj(hidden_states)
+        k = self.k_proj(hidden_states)
+        v = self.v_proj(hidden_states)
+
+        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
+
+        # Apply RoPE using custom Triton Kernel (In-place)
+        apply_rope_inplace(q, k, self.cos_cached, self.sin_cached, position_ids)
+
+        # Handle KV Cache updates
+        if kv_caches is not None:
+            k, v = kv_caches.update(self.layer_idx, k, v)
+        
+        # Repeat K/V for GQA
+        k = k.repeat_interleave(self.num_key_value_groups, dim=2)
+        v = v.repeat_interleave(self.num_key_value_groups, dim=2)
+
+        # PyTorch SDPA (FlashAttention fallback handled automatically by PyTorch 2.x)
+        q = q.transpose(1, 2) # (batch, num_heads, seq_len, head_dim)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Use causal mask only for sequences (Prefill). For single token decoding, it's not needed
+        is_causal = seq_len > 1
+        
+        attn_output = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, 
+            is_causal=is_causal
+        )
+        
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(batch_size, seq_len, self.hidden_size)
+        
+        # Output projection
+        output = self.o_proj(attn_output)
+        return output
+
+class Qwen2MLP(nn.Module):
+    def __init__(self, config: Qwen2Config):
+        super().__init__()
+        self.config = config
+        
+        self.gate_proj = LinearAWQ(config.hidden_size, config.intermediate_size, group_size=config.group_size, has_bias=False)
+        self.up_proj = LinearAWQ(config.hidden_size, config.intermediate_size, group_size=config.group_size, has_bias=False)
+        self.down_proj = LinearAWQ(config.intermediate_size, config.hidden_size, group_size=config.group_size, has_bias=False)
+
+    def forward(self, x):
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        
+        # Fused SwiGLU: SiLU(gate) * up
+        # Using custom Triton kernel
+        intermediate = silu_mul_forward(gate, up)
+        
+        down = self.down_proj(intermediate)
+        return down
+
+class Qwen2DecoderLayer(nn.Module):
+    def __init__(self, config: Qwen2Config, layer_idx: int):
+        super().__init__()
+        self.self_attn = Qwen2Attention(config, layer_idx)
+        self.mlp = Qwen2MLP(config)
+        self.input_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor,
+        kv_caches = None,
+    ):
+        # Attention block
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, position_ids, kv_caches)
+        hidden_states = residual + hidden_states
+
+        # MLP block
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+class Qwen2Model(nn.Module):
+    def __init__(self, config: Qwen2Config):
+        super().__init__()
+        self.config = config
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([Qwen2DecoderLayer(config, i) for i in range(config.num_hidden_layers)])
+        self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, kv_caches=None):
+        hidden_states = self.embed_tokens(input_ids)
+        
+        for layer in self.layers:
+            hidden_states = layer(hidden_states, position_ids, kv_caches)
+            
+        hidden_states = self.norm(hidden_states)
+        return hidden_states
+
+class Qwen2ForCausalLM(nn.Module):
+    def __init__(self, config: Qwen2Config):
+        super().__init__()
+        self.config = config
+        self.model = Qwen2Model(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+
+    def load_awq_weights(self, weights_generator):
+        """
+        Loads the AWQ safetensors into the module buffers sequentially.
+        """
+        print("Mapping quantized weights to engine buffers...")
+        # Since safetensors loading yields sequentially, we can map parameter names exactly.
+        
+        # Build a flattening dict for all buffers/params
+        state_dict = self.state_dict()
+        
+        matched = 0
+        for name, tensor in weights_generator:
+            if name in state_dict:
+                state_dict[name].copy_(tensor)
+                matched += 1
+            else:
+                # E.g. lm_head vs model.embed_tokens depending on tied embeddings
+                pass
+                
+        print(f"Loaded {matched} weight tensors.")
+
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, kv_caches=None):
+        hidden_states = self.model(input_ids, position_ids, kv_caches)
+        logits = self.lm_head(hidden_states)
+        return logits
